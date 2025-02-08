@@ -1,0 +1,11 @@
+[package]
+name = "tracing-logtail"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A tracing subscriber that logs to logtail/betterstack"
+
+[dependencies]
+tokio = "1.43.0"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
