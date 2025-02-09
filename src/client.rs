@@ -74,15 +74,29 @@ impl BetterstackClient {
 #[derive(Serialize)]
 struct BetterstackEvent {
     message: String,
+    dt: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dt: Option<String>,
+    level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<u32>,
 }
 
 impl From<LogEvent> for BetterstackEvent {
     fn from(event: LogEvent) -> Self {
         Self {
             message: event.message,
-            dt: Some(event.timestamp.to_rfc3339()),
+            dt: event.timestamp.to_utc().timestamp_millis(),
+            level: event.level,
+            target: event.target,
+            thread_id: event.thread_id,
+            file: event.file,
+            line: event.line,
         }
     }
 }
@@ -145,10 +159,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_empty_token() {
         let client = BetterstackClient::new("", "");
-        let logs = vec![LogEvent {
-            message: "test".into(),
-            timestamp: chrono::Utc::now(),
-        }];
+        let logs = vec![LogEvent::new("test".into())];
 
         let result = client.put_logs(LogDestination, logs).await;
         assert!(matches!(result, Err(BetterstackError::InvalidConfig(_))));
@@ -157,25 +168,47 @@ mod tests {
     #[tokio::test]
     async fn test_noop_client() {
         let client = NoopBetterstackClient::new();
-        let logs = vec![LogEvent {
-            message: "test".into(),
-            timestamp: chrono::Utc::now(),
-        }];
+        let logs = vec![LogEvent::new("test".into())];
 
         let result = client.put_logs(LogDestination, logs).await;
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_event_serialization() {
+    #[test]
+    fn test_event_serialization() {
         let now = Utc::now();
         let event = LogEvent {
             message: "test message".into(),
             timestamp: now,
+            level: Some("INFO".into()),
+            target: Some("test_target".into()),
+            thread_id: Some("ThreadId(1)".into()),
+            file: Some("test.rs".into()),
+            line: Some(42),
         };
 
         let betterstack_event: BetterstackEvent = event.into();
         assert_eq!(betterstack_event.message, "test message");
-        assert_eq!(betterstack_event.dt, Some(now.to_rfc3339()));
+        assert_eq!(betterstack_event.dt, now.timestamp_millis());
+        assert_eq!(betterstack_event.level, Some("INFO".into()));
+        assert_eq!(betterstack_event.target, Some("test_target".into()));
+        assert_eq!(betterstack_event.thread_id, Some("ThreadId(1)".into()));
+        assert_eq!(betterstack_event.file, Some("test.rs".into()));
+        assert_eq!(betterstack_event.line, Some(42));
+    }
+
+    #[test]
+    fn test_client_new() {
+        let client = BetterstackClient::new("token", "url");
+        assert_eq!(client.source_token, "token");
+        assert_eq!(client.ingestion_url, "url");
+    }
+
+    #[test]
+    fn test_client_with_custom_http_client() {
+        let http_client = reqwest::Client::new();
+        let client = BetterstackClient::with_client(http_client, "token", "url");
+        assert_eq!(client.source_token, "token");
+        assert_eq!(client.ingestion_url, "url");
     }
 }
