@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A tracing subscriber that logs to betterstack (logtail)"
+repository = "https://github.com/rishi8094/tracing-betterstack"
+homepage = "https://github.com/rishi8094/tracing-betterstack"
+readme = "README.md"
 
 [dependencies]
 chrono = "0.4.39"
