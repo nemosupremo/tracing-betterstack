@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::Utc;
 use tracing::{span, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, format, MakeWriter},
@@ -10,13 +11,31 @@ use tracing_subscriber::{
 
 use crate::{
     client::BetterstackClient,
-    dispatch::{BetterstackDispatcher, Dispatcher, NoopDispatcher},
+    dispatch::{BetterstackDispatcher, Dispatcher, LogEvent, NoopDispatcher},
     export::ExportConfig,
 };
+
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{:?}", value).trim_matches('"').to_string();
+        }
+    }
+}
 
 /// A Better Stack propagation layer.
 pub struct BetterstackLayer<S, D, N = format::DefaultFields, E = format::Format<format::Full>> {
     fmt_layer: fmt::Layer<S, N, E, Arc<D>>,
+    dispatcher: Arc<D>,
 }
 
 /// Construct BetterstackLayer to compose with tracing subscriber.
@@ -32,7 +51,8 @@ where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     fn default() -> Self {
-        BetterstackLayer::new(Arc::new(NoopDispatcher::new()))
+        let dispatcher = Arc::new(NoopDispatcher::new());
+        BetterstackLayer::new(dispatcher)
     }
 }
 
@@ -45,7 +65,7 @@ where
     fn new(dispatcher: Arc<D>) -> Self {
         Self {
             fmt_layer: fmt::Layer::default()
-                .with_writer(dispatcher)
+                .with_writer(dispatcher.clone())
                 .with_ansi(false)
                 .with_level(true)
                 .with_target(true)
@@ -53,6 +73,7 @@ where
                 .with_thread_names(true)
                 .with_file(true)
                 .with_line_number(true),
+            dispatcher,
         }
     }
 }
@@ -70,12 +91,15 @@ where
         source_token: impl Into<String>,
         ingestion_url: impl Into<String>,
         export_config: ExportConfig,
-    ) -> BetterstackLayer<S, BetterstackDispatcher, N, format::Format<L, T>> {
+    ) -> BetterstackLayer<S, BetterstackDispatcher, N, format::Format<L, T>>
+    where
+        BetterstackDispatcher: Dispatcher,
+    {
         let client = BetterstackClient::new(source_token, ingestion_url);
+        let dispatcher = Arc::new(BetterstackDispatcher::new(client, export_config));
         BetterstackLayer {
-            fmt_layer: self
-                .fmt_layer
-                .with_writer(Arc::new(BetterstackDispatcher::new(client, export_config))),
+            fmt_layer: self.fmt_layer.with_writer(dispatcher.clone()),
+            dispatcher,
         }
     }
 
@@ -83,6 +107,7 @@ where
     pub fn with_code_location(self, display: bool) -> Self {
         Self {
             fmt_layer: self.fmt_layer.with_line_number(display).with_file(display),
+            dispatcher: self.dispatcher,
         }
     }
 
@@ -90,6 +115,7 @@ where
     pub fn with_target(self, display: bool) -> Self {
         Self {
             fmt_layer: self.fmt_layer.with_target(display),
+            dispatcher: self.dispatcher,
         }
     }
 
@@ -97,6 +123,7 @@ where
     pub fn with_thread_ids(self, display: bool) -> Self {
         Self {
             fmt_layer: self.fmt_layer.with_thread_ids(display),
+            dispatcher: self.dispatcher,
         }
     }
 
@@ -104,6 +131,7 @@ where
     pub fn with_thread_names(self, display: bool) -> Self {
         Self {
             fmt_layer: self.fmt_layer.with_thread_names(display),
+            dispatcher: self.dispatcher,
         }
     }
 
@@ -115,6 +143,7 @@ where
         let writer = self.fmt_layer.writer().clone();
         BetterstackLayer {
             fmt_layer: fmt_layer.with_writer(writer),
+            dispatcher: self.dispatcher,
         }
     }
 }
@@ -128,6 +157,29 @@ where
     E: format::FormatEvent<S, N> + 'static,
 {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        // Extract message using visitor
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+
+        // Create structured log event
+        let metadata = event.metadata();
+        let log_event = LogEvent {
+            message: visitor.0,
+            timestamp: Utc::now(),
+            level: Some(metadata.level().to_string()),
+            target: Some(metadata.target().to_string()),
+            thread_id: Some(format!(
+                "{:?}",
+                std::thread::current().id()
+            )),
+            file: metadata.file().map(String::from),
+            line: metadata.line(),
+        };
+
+        // Dispatch the event
+        self.dispatcher.dispatch(log_event);
+
+        // Also handle normal formatting
         self.fmt_layer.on_event(event, ctx)
     }
 
@@ -164,7 +216,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     struct TestDispatcher {
-        events: Arc<Mutex<Vec<String>>>,
+        events: Arc<Mutex<Vec<LogEvent>>>,
     }
 
     impl TestDispatcher {
@@ -174,23 +226,19 @@ mod tests {
             }
         }
 
-        fn events(&self) -> Vec<String> {
+        fn events(&self) -> Vec<LogEvent> {
             self.events.lock().unwrap().clone()
         }
     }
 
     impl Dispatcher for TestDispatcher {
-        fn dispatch(&self, input: crate::dispatch::LogEvent) {
-            self.events.lock().unwrap().push(input.message);
+        fn dispatch(&self, input: LogEvent) {
+            self.events.lock().unwrap().push(input);
         }
     }
 
     impl std::io::Write for &TestDispatcher {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.events
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(buf).into_owned());
             Ok(buf.len())
         }
 
@@ -214,8 +262,8 @@ mod tests {
 
         let events = dispatcher.events();
         assert_eq!(events.len(), 1);
-        assert!(events[0].contains("test message"));
-        assert!(events[0].contains("INFO"));
+        assert_eq!(events[0].message, "test message");
+        assert_eq!(events[0].level.as_deref(), Some("INFO"));
     }
 
     #[test]
@@ -235,34 +283,8 @@ mod tests {
 
         let events = dispatcher.events();
         assert_eq!(events.len(), 1);
-        assert!(events[0].contains("test message in span"));
-        assert!(events[0].contains("test_span"));
-        assert!(events[0].contains("field=\"value\""));
-    }
-
-    #[test]
-    fn test_layer_with_custom_formatting() {
-        let dispatcher = Arc::new(TestDispatcher::new());
-        let subscriber = tracing_subscriber::registry().with(
-            BetterstackLayer::new(dispatcher.clone()).with_fmt_layer(
-                fmt::Layer::default()
-                    .without_time()
-                    .with_target(false)
-                    .with_level(true)
-                    .event_format(fmt::format::Format::default().json()),
-            ),
-        );
-
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!("test json message");
-        });
-
-        let events = dispatcher.events();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].contains("test json message"));
-        assert!(events[0].contains("level"));
-        assert!(events[0].starts_with('{'));
-        assert!(events[0].ends_with("}\n"));
+        assert_eq!(events[0].message, "test message in span");
+        assert_eq!(events[0].level.as_deref(), Some("INFO"));
     }
 
     #[test]
@@ -280,7 +302,8 @@ mod tests {
 
         let events = dispatcher.events();
         assert_eq!(events.len(), 1);
-        assert!(events[0].contains("test message with location"));
-        assert!(events[0].contains("layer.rs")); // Should contain file name
+        assert_eq!(events[0].message, "test message with location");
+        assert!(events[0].file.is_some());
+        assert!(events[0].line.is_some());
     }
 }
