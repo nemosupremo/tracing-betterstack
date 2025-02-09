@@ -6,7 +6,7 @@ use crate::{
     export::{BatchExporter, ExportConfig},
 };
 
-pub trait Dispatcher {
+pub trait Dispatcher: Send + Sync {
     fn dispatch(&self, input: LogEvent);
 }
 
@@ -14,6 +14,11 @@ pub trait Dispatcher {
 pub struct LogEvent {
     pub message: String,
     pub timestamp: DateTime<Utc>,
+    pub level: Option<String>,
+    pub target: Option<String>,
+    pub thread_id: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
 }
 
 impl LogEvent {
@@ -21,11 +26,35 @@ impl LogEvent {
         Self {
             message,
             timestamp: Utc::now(),
+            level: None,
+            target: None,
+            thread_id: None,
+            file: None,
+            line: None,
+        }
+    }
+
+    pub fn with_metadata(
+        message: String,
+        level: Option<String>,
+        target: Option<String>,
+        thread_id: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+    ) -> Self {
+        Self {
+            message,
+            timestamp: Utc::now(),
+            level,
+            target,
+            thread_id,
+            file,
+            line,
         }
     }
 }
 
-pub struct NoopDispatcher {}
+pub struct NoopDispatcher;
 
 impl Dispatcher for NoopDispatcher {
     fn dispatch(&self, _event: LogEvent) {}
@@ -33,7 +62,7 @@ impl Dispatcher for NoopDispatcher {
 
 impl NoopDispatcher {
     pub(crate) fn new() -> Self {
-        Self {}
+        Self
     }
 }
 
@@ -60,7 +89,10 @@ impl BetterstackDispatcher {
 impl Dispatcher for BetterstackDispatcher {
     fn dispatch(&self, event: LogEvent) {
         if let Err(err) = self.tx.send(event) {
-            eprintln!("[tracing-betterstack] Failed to dispatch log event: {}", err);
+            eprintln!(
+                "[tracing-betterstack] Failed to dispatch log event: {}",
+                err
+            );
         }
     }
 }
@@ -77,8 +109,6 @@ impl std::io::Write for &NoopDispatcher {
 
 impl std::io::Write for &BetterstackDispatcher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let message = String::from_utf8_lossy(buf).to_string();
-        self.dispatch(LogEvent::new(message));
         Ok(buf.len())
     }
 
@@ -121,5 +151,44 @@ mod tests {
         let mut dispatcher_ref = &dispatcher;
         assert!(dispatcher_ref.write_all(b"test message").is_ok());
         assert!(dispatcher_ref.flush().is_ok());
+    }
+
+    #[test]
+    fn test_log_event_new() {
+        let message = "test message";
+        let event = LogEvent::new(message.to_string());
+
+        assert_eq!(event.message, message);
+        assert!(event.level.is_none());
+        assert!(event.target.is_none());
+        assert!(event.thread_id.is_none());
+        assert!(event.file.is_none());
+        assert!(event.line.is_none());
+    }
+
+    #[test]
+    fn test_log_event_with_metadata() {
+        let message = "test message";
+        let level = Some("INFO".to_string());
+        let target = Some("test_target".to_string());
+        let thread_id = Some("ThreadId(1)".to_string());
+        let file = Some("test.rs".to_string());
+        let line = Some(42);
+
+        let event = LogEvent::with_metadata(
+            message.to_string(),
+            level.clone(),
+            target.clone(),
+            thread_id.clone(),
+            file.clone(),
+            line,
+        );
+
+        assert_eq!(event.message, message);
+        assert_eq!(event.level, level);
+        assert_eq!(event.target, target);
+        assert_eq!(event.thread_id, thread_id);
+        assert_eq!(event.file, file);
+        assert_eq!(event.line, line);
     }
 }
