@@ -11,7 +11,11 @@ pub use layer::{layer, BetterstackLayer};
 mod tests {
     use super::*;
     use std::{env, time::Duration};
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{
+        fmt::{self, format::FmtSpan},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
 
     fn init_env() -> Result<(String, String), Box<dyn std::error::Error>> {
         dotenv::dotenv().ok();
@@ -22,6 +26,15 @@ mod tests {
             env::var("BETTERSTACK_INGEST_URL").map_err(|_| "BETTERSTACK_INGEST_URL not set")?;
 
         Ok((token, url))
+    }
+
+    fn init_subscriber(token: String, url: String) -> impl tracing::Subscriber {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target().starts_with("tracing_betterstack")
+            }))
+            .with(layer().with_client(token, url, ExportConfig::default()))
+            .with(fmt::Layer::new().with_span_events(FmtSpan::CLOSE))
     }
 
     #[test]
@@ -44,23 +57,7 @@ mod tests {
             }
         };
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::filter_fn(|metadata| {
-                // Only allow logs from our crate
-                metadata.target().starts_with("tracing_betterstack")
-            }))
-            .with(
-                layer()
-                    .with_client(
-                        token,
-                        url,
-                        ExportConfig::default()
-                            .with_batch_size(10)
-                            .with_interval(Duration::from_millis(100)),
-                    )
-                    .with_code_location(true)
-                    .with_target(true),
-            );
+        let subscriber = init_subscriber(token, url);
 
         let _guard = subscriber.set_default();
         tracing::info!(target: "tracing_betterstack::test", "Test log message");
@@ -77,28 +74,15 @@ mod tests {
             }
         };
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::filter_fn(|metadata| {
-                // Only allow logs from our crate
-                metadata.target().starts_with("tracing_betterstack")
-            }))
-            .with(
-                layer()
-                    .with_client(token, url, ExportConfig::default())
-                    .with_fmt_layer(
-                        tracing_subscriber::fmt::layer()
-                            .json()
-                            .with_current_span(true)
-                            .with_span_list(true),
-                    ),
-            );
-
+        let subscriber = init_subscriber(token, url);
         let _guard = subscriber.set_default();
+
         let span = tracing::info_span!(
             target: "tracing_betterstack::test",
             "test_span",
             field = "value"
         );
+
         let _span_guard = span.enter();
         tracing::info!(target: "tracing_betterstack::test", "Test log message with custom format");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -114,20 +98,7 @@ mod tests {
             }
         };
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.target().starts_with("tracing_betterstack")
-            }))
-            .with(
-                layer().with_client(
-                    token,
-                    url,
-                    ExportConfig::default()
-                        .with_batch_size(2)
-                        .with_interval(Duration::from_millis(500)),
-                ),
-            );
-
+        let subscriber = init_subscriber(token, url);
         let _guard = subscriber.set_default();
 
         tracing::info!(target: "tracing_betterstack::test", "Batch test message 1");
@@ -146,20 +117,7 @@ mod tests {
             }
         };
 
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.target().starts_with("tracing_betterstack")
-            }))
-            .with(
-                layer().with_client(
-                    token,
-                    url,
-                    ExportConfig::default()
-                        .with_batch_size(10)
-                        .with_interval(Duration::from_millis(200)),
-                ),
-            );
-
+        let subscriber = init_subscriber(token, url);
         let _guard = subscriber.set_default();
 
         tracing::info!(target: "tracing_betterstack::test", "Interval flush test message");
