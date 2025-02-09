@@ -16,7 +16,7 @@ pub struct ExportConfig {
 impl Default for ExportConfig {
     fn default() -> Self {
         Self {
-            batch_size: 100, // Optimized for Betterstack's batch handling
+            batch_size: 100,
             interval: Duration::from_secs(5),
         }
     }
@@ -93,9 +93,9 @@ where
         }
     }
 
-
-      async fn flush_queue(&mut self) {
-        if let Err(err) = self.client
+    async fn flush_queue(&mut self) {
+        if let Err(err) = self
+            .client
             .put_logs(LogDestination, std::mem::take(&mut self.queue))
             .await
         {
@@ -104,7 +104,6 @@ where
         self.queue.clear();
         self.queue.reserve(self.config.batch_size);
     }
-
 }
 
 #[cfg(test)]
@@ -112,7 +111,6 @@ mod tests {
     use crate::client::BetterstackError;
 
     use super::*;
-    use chrono::Utc;
     use std::{
         future::Future,
         pin::Pin,
@@ -161,16 +159,10 @@ mod tests {
         let handle = tokio::spawn(exporter.run(rx));
 
         // Send events
-        let event1 = LogEvent {
-            message: "test1".into(),
-            timestamp: Utc::now(),
-        };
-        let event2 = LogEvent {
-            message: "test2".into(),
-            timestamp: Utc::now(),
-        };
-        tx.send(event1.clone()).unwrap();
-        tx.send(event2.clone()).unwrap();
+        let event1 = LogEvent::new("test1".into());
+        let event2 = LogEvent::new("test2".into());
+        tx.send(event1).unwrap();
+        tx.send(event2).unwrap();
 
         // Give some time for processing
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -201,11 +193,8 @@ mod tests {
         let handle = tokio::spawn(exporter.run(rx));
 
         // Send one event
-        let event = LogEvent {
-            message: "test".into(),
-            timestamp: Utc::now(),
-        };
-        tx.send(event.clone()).unwrap();
+        let event = LogEvent::new("test".into());
+        tx.send(event).unwrap();
 
         // Wait for interval to trigger
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -235,11 +224,8 @@ mod tests {
         let handle = tokio::spawn(exporter.run(rx));
 
         // Send an event
-        let event = LogEvent {
-            message: "test".into(),
-            timestamp: Utc::now(),
-        };
-        tx.send(event.clone()).unwrap();
+        let event = LogEvent::new("test".into());
+        tx.send(event).unwrap();
 
         // Drop the sender to trigger flush
         drop(tx);
@@ -249,5 +235,15 @@ mod tests {
         let logs = received_logs.lock().unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "test");
+    }
+
+    #[test]
+    fn test_export_config() {
+        let config = ExportConfig::default()
+            .with_batch_size(50)
+            .with_interval(Duration::from_secs(10));
+
+        assert_eq!(config.batch_size, 50);
+        assert_eq!(config.interval, Duration::from_secs(10));
     }
 }
