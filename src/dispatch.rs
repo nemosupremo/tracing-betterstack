@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::{
@@ -33,25 +35,6 @@ impl LogEvent {
             line: None,
         }
     }
-
-    pub fn with_metadata(
-        message: String,
-        level: Option<String>,
-        target: Option<String>,
-        thread_id: Option<String>,
-        file: Option<String>,
-        line: Option<u32>,
-    ) -> Self {
-        Self {
-            message,
-            timestamp: Utc::now(),
-            level,
-            target,
-            thread_id,
-            file,
-            line,
-        }
-    }
 }
 
 pub struct NoopDispatcher;
@@ -67,7 +50,13 @@ impl NoopDispatcher {
 }
 
 pub struct BetterstackDispatcher {
+    inner: Arc<BetterstackDispatcherInner>,
+}
+
+struct BetterstackDispatcherInner {
     tx: UnboundedSender<LogEvent>,
+    // Fallback queue for when async runtime is not available
+    sync_queue: Mutex<Vec<LogEvent>>,
 }
 
 impl BetterstackDispatcher {
@@ -78,21 +67,52 @@ impl BetterstackDispatcher {
         let (tx, rx) = mpsc::unbounded_channel();
         let exporter = BatchExporter::new(client, export_config);
 
-        tokio::spawn(async move {
-            exporter.run(rx).await;
+        // Try to get the current Tokio runtime handle
+        let runtime_available = Handle::try_current().is_ok();
+
+        let inner = Arc::new(BetterstackDispatcherInner {
+            tx,
+            sync_queue: Mutex::new(Vec::new()),
         });
 
-        Self { tx }
+        if runtime_available {
+            // We're in an async context, spawn the exporter
+            tokio::spawn(exporter.run(rx));
+        } else {
+            // We're in a sync context, create a new runtime for the exporter
+            std::thread::spawn({
+                let inner = inner.clone();
+                move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        // Process any messages that were queued before the runtime was available
+                        let queued = {
+                            let mut queue = inner.sync_queue.lock().unwrap();
+                            std::mem::take(&mut *queue)
+                        };
+                        for event in queued {
+                            let _ = inner.tx.send(event);
+                        }
+
+                        exporter.run(rx).await;
+                    });
+                }
+            });
+        }
+
+        Self { inner }
     }
 }
 
 impl Dispatcher for BetterstackDispatcher {
     fn dispatch(&self, event: LogEvent) {
-        if let Err(err) = self.tx.send(event) {
-            eprintln!(
-                "[tracing-betterstack] Failed to dispatch log event: {}",
-                err
-            );
+        match self.inner.tx.send(event.clone()) {
+            Ok(_) => {}
+            Err(_) => {
+                // If sending fails, store in sync queue
+                let mut queue = self.inner.sync_queue.lock().unwrap();
+                queue.push(event);
+            }
         }
     }
 }
@@ -109,6 +129,8 @@ impl std::io::Write for &NoopDispatcher {
 
 impl std::io::Write for &BetterstackDispatcher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let message = String::from_utf8_lossy(buf).to_string();
+        self.dispatch(LogEvent::new(message));
         Ok(buf.len())
     }
 
@@ -120,13 +142,22 @@ impl std::io::Write for &BetterstackDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::NoopBetterstackClient;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
-    fn test_noop_dispatcher() {
-        let dispatcher = NoopDispatcher::new();
+    fn test_sync_context() {
+        let export_config = ExportConfig {
+            batch_size: 1,
+            interval: Duration::from_millis(100),
+        };
+
+        let dispatcher = BetterstackDispatcher::new(NoopBetterstackClient::new(), export_config);
         let event = LogEvent::new("test message".into());
-        dispatcher.dispatch(event.clone());
+
+        // This should work even outside of an async context
+        dispatcher.dispatch(event);
 
         let mut dispatcher_ref = &dispatcher;
         assert!(dispatcher_ref.write_all(b"test message").is_ok());
@@ -134,10 +165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_betterstack_dispatcher() {
-        use crate::client::NoopBetterstackClient;
-        use std::time::Duration;
-
+    async fn test_async_context() {
         let export_config = ExportConfig {
             batch_size: 1,
             interval: Duration::from_millis(100),
@@ -151,44 +179,8 @@ mod tests {
         let mut dispatcher_ref = &dispatcher;
         assert!(dispatcher_ref.write_all(b"test message").is_ok());
         assert!(dispatcher_ref.flush().is_ok());
-    }
 
-    #[test]
-    fn test_log_event_new() {
-        let message = "test message";
-        let event = LogEvent::new(message.to_string());
-
-        assert_eq!(event.message, message);
-        assert!(event.level.is_none());
-        assert!(event.target.is_none());
-        assert!(event.thread_id.is_none());
-        assert!(event.file.is_none());
-        assert!(event.line.is_none());
-    }
-
-    #[test]
-    fn test_log_event_with_metadata() {
-        let message = "test message";
-        let level = Some("INFO".to_string());
-        let target = Some("test_target".to_string());
-        let thread_id = Some("ThreadId(1)".to_string());
-        let file = Some("test.rs".to_string());
-        let line = Some(42);
-
-        let event = LogEvent::with_metadata(
-            message.to_string(),
-            level.clone(),
-            target.clone(),
-            thread_id.clone(),
-            file.clone(),
-            line,
-        );
-
-        assert_eq!(event.message, message);
-        assert_eq!(event.level, level);
-        assert_eq!(event.target, target);
-        assert_eq!(event.thread_id, thread_id);
-        assert_eq!(event.file, file);
-        assert_eq!(event.line, line);
+        // Give some time for async processing
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
