@@ -1,4 +1,10 @@
-# Tracing for Better Stack
+# Tracing for Better Stack (WIP)
+
+This library is a work in progress and is not yet ready for production use.
+
+### TODO
+ - [ ] Fix spans not being sent
+ - [ ] Fix logs not flushing on exit
 
 ## Overview
 
