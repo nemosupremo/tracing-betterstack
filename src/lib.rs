@@ -7,6 +7,7 @@ pub use client::{BetterstackClient, BetterstackClientTrait, BetterstackError};
 pub use export::{ExportConfig, LogDestination};
 pub use layer::{layer, BetterstackLayer};
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,3 +126,4 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
+*/

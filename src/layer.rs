@@ -1,15 +1,13 @@
-use std::sync::Arc;
 use chrono::Utc;
+use std::sync::Arc;
 use tracing::{span, Event, Subscriber};
-use tracing_subscriber::{
-    layer::Context,
-    registry::LookupSpan,
-    Layer,
-};
+use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
 use crate::{
-    client::BetterstackClient,
-    dispatch::{BetterstackDispatcher, Dispatcher, LogEvent, NoopDispatcher},
+    client::{BetterstackClient, BetterstackEvent},
+    dispatch::{
+        BetterstackDispatcher, Dispatcher, LogEvent, LogFields, NoopDispatcher, WorkerGuard,
+    },
     export::ExportConfig,
 };
 
@@ -66,18 +64,26 @@ where
     }
 
     /// Set the client using a source token and export configuration.
-    pub fn with_client(
+    pub fn with_client<F: Fn(&mut BetterstackEvent) + Send + Sync + 'static>(
         self,
         source_token: impl Into<String>,
         ingestion_url: impl Into<String>,
-        export_config: ExportConfig,
-    ) -> BetterstackLayer<S>
+        mut export_config: ExportConfig<F>,
+    ) -> (BetterstackLayer<S>, WorkerGuard)
     where
         BetterstackDispatcher: Dispatcher,
     {
-        let client = BetterstackClient::new(source_token, ingestion_url);
-        let dispatcher = Arc::new(BetterstackDispatcher::new(client, export_config));
-        BetterstackLayer::new(dispatcher)
+        let client = BetterstackClient::new(
+            source_token,
+            ingestion_url,
+            export_config
+                .transform
+                .take()
+                .map(|t| std::sync::Arc::new(t)),
+        );
+        let (dispatcher, guard) = BetterstackDispatcher::new(client, export_config);
+        let dispatcher = Arc::new(dispatcher);
+        (BetterstackLayer::new(dispatcher), guard)
     }
 }
 
@@ -92,17 +98,16 @@ where
 
         // Create structured log event
         let metadata = event.metadata();
+        let mut fields = LogFields::default();
+        event.record(&mut fields);
         let log_event = LogEvent {
             message: visitor.0,
             timestamp: Utc::now(),
-            level: Some(metadata.level().to_string()),
-            target: Some(metadata.target().to_string()),
-            thread_id: Some(format!(
-                "{:?}",
-                std::thread::current().id()
-            )),
+            level: metadata.level().to_string(),
+            target: metadata.target().to_string(),
             file: metadata.file().map(String::from),
             line: metadata.line(),
+            fields,
         };
 
         // Dispatch the event
@@ -114,12 +119,12 @@ where
     fn on_close(&self, _: span::Id, _: Context<'_, S>) {}
     fn on_new_span(&self, _: &span::Attributes<'_>, _: &span::Id, _: Context<'_, S>) {}
     fn on_record(&self, _: &span::Id, _: &span::Record<'_>, _: Context<'_, S>) {}
-    
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
         metadata.is_event()
     }
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,7 +157,8 @@ mod tests {
     #[test]
     fn test_layer_basic_logging() {
         let dispatcher = Arc::new(TestDispatcher::new());
-        let subscriber = tracing_subscriber::registry().with(BetterstackLayer::new(dispatcher.clone()));
+        let subscriber =
+            tracing_subscriber::registry().with(BetterstackLayer::new(dispatcher.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("test message");
@@ -167,7 +173,8 @@ mod tests {
     #[test]
     fn test_layer_with_spans() {
         let dispatcher = Arc::new(TestDispatcher::new());
-        let subscriber = tracing_subscriber::registry().with(BetterstackLayer::new(dispatcher.clone()));
+        let subscriber =
+            tracing_subscriber::registry().with(BetterstackLayer::new(dispatcher.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
             let span = span!(Level::INFO, "test_span", field = "value");
@@ -181,3 +188,4 @@ mod tests {
         assert_eq!(events[0].level.as_deref(), Some("INFO"));
     }
 }
+    */

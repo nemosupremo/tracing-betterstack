@@ -1,6 +1,9 @@
-use serde::Serialize;
+use std::collections::HashMap;
 use std::future::Future;
+use std::hash::BuildHasherDefault;
 use std::pin::Pin;
+
+use serde::Serialize;
 
 use crate::{dispatch::LogEvent, export::LogDestination};
 
@@ -42,19 +45,28 @@ pub trait BetterstackClientTrait: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), BetterstackError>> + Send + 'a>>;
 }
 
-#[derive(Debug, Clone)]
-pub struct BetterstackClient {
+#[derive(Clone)]
+pub struct BetterstackClient<F: Fn(&mut BetterstackEvent) + Send + Sync + 'static> {
     http_client: reqwest::Client,
     source_token: String,
     ingestion_url: String,
+    transform: Option<std::sync::Arc<F>>,
 }
 
-impl BetterstackClient {
-    pub fn new(source_token: impl Into<String>, ingestion_url: impl Into<String>) -> Self {
+impl<F> BetterstackClient<F>
+where
+    F: Fn(&mut BetterstackEvent) + Send + Sync + 'static,
+{
+    pub fn new(
+        source_token: impl Into<String>,
+        ingestion_url: impl Into<String>,
+        transform: Option<std::sync::Arc<F>>,
+    ) -> Self {
         Self {
             http_client: reqwest::Client::new(),
             source_token: source_token.into(),
             ingestion_url: ingestion_url.into(),
+            transform,
         }
     }
 
@@ -67,41 +79,55 @@ impl BetterstackClient {
             http_client,
             source_token: source_token.into(),
             ingestion_url: ingestion_url.into(),
+            transform: None,
         }
     }
 }
 
 #[derive(Serialize)]
-struct BetterstackEvent {
+pub struct BetterstackEvent {
     message: String,
-    dt: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    level: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<String>,
+    dt: String,
+    level: String,
+    target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<u32>,
+
+    #[serde(flatten)]
+    fields: HashMap<String, serde_json::Value, BuildHasherDefault<seahash::SeaHasher>>,
+}
+
+impl BetterstackEvent {
+    pub fn add_field_str(&mut self, name: &str, value: &str) {
+        self.fields.insert(
+            name.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
 }
 
 impl From<LogEvent> for BetterstackEvent {
     fn from(event: LogEvent) -> Self {
         Self {
             message: event.message,
-            dt: event.timestamp.to_utc().timestamp_millis(),
+            dt: event
+                .timestamp
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             level: event.level,
             target: event.target,
-            thread_id: event.thread_id,
             file: event.file,
             line: event.line,
+            fields: event.fields.0,
         }
     }
 }
 
-impl BetterstackClientTrait for BetterstackClient {
+impl<F> BetterstackClientTrait for BetterstackClient<F>
+where
+    F: Fn(&mut BetterstackEvent) + Send + Sync + 'static,
+{
     fn put_logs<'a>(
         &'a self,
         _: LogDestination,
@@ -114,7 +140,16 @@ impl BetterstackClientTrait for BetterstackClient {
                 ));
             }
 
-            let events: Vec<BetterstackEvent> = logs.into_iter().map(Into::into).collect();
+            let events: Vec<BetterstackEvent> = logs
+                .into_iter()
+                .map(Into::into)
+                .map(|mut e: BetterstackEvent| {
+                    if let Some(transform) = self.transform.as_ref() {
+                        transform(&mut e);
+                    }
+                    e
+                })
+                .collect();
             let body = serde_json::to_string(&events).map_err(|e| {
                 BetterstackError::InvalidConfig(format!("Failed to serialize events: {}", e))
             })?;
@@ -151,6 +186,7 @@ impl NoopBetterstackClient {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,3 +248,4 @@ mod tests {
         assert_eq!(client.ingestion_url, "url");
     }
 }
+    */

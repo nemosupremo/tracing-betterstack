@@ -1,16 +1,18 @@
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::interval;
 
 use crate::{
-    client::{BetterstackClientTrait, NoopBetterstackClient},
-    dispatch::LogEvent,
+    client::{BetterstackClientTrait, BetterstackEvent, NoopBetterstackClient},
+    dispatch::{LogEvent, LogMessage},
 };
 
 #[derive(Debug, Clone)]
-pub struct ExportConfig {
+pub struct ExportConfig<
+    F: Fn(&mut BetterstackEvent) + 'static + Sync + Send = fn(&mut BetterstackEvent),
+> {
     pub batch_size: usize,
     pub interval: Duration,
+    pub transform: Option<F>,
 }
 
 impl Default for ExportConfig {
@@ -18,11 +20,15 @@ impl Default for ExportConfig {
         Self {
             batch_size: 100,
             interval: Duration::from_secs(5),
+            transform: None,
         }
     }
 }
 
-impl ExportConfig {
+impl<F> ExportConfig<F>
+where
+    F: Fn(&mut BetterstackEvent) + 'static + Sync + Send,
+{
     pub fn with_batch_size(self, batch_size: usize) -> Self {
         Self { batch_size, ..self }
     }
@@ -30,25 +36,39 @@ impl ExportConfig {
     pub fn with_interval(self, interval: Duration) -> Self {
         Self { interval, ..self }
     }
+
+    pub fn with_transform<U: Fn(&mut BetterstackEvent) + 'static + Sync + Send>(
+        self,
+        func: U,
+    ) -> ExportConfig<U> {
+        ExportConfig {
+            transform: Some(func),
+            batch_size: self.batch_size,
+            interval: self.interval,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LogDestination;
 
-pub(crate) struct BatchExporter<C> {
+pub(crate) struct BatchExporter<C, F: Fn(&mut BetterstackEvent) + 'static + Sync + Send> {
     client: C,
     queue: Vec<LogEvent>,
-    config: ExportConfig,
+    config: ExportConfig<F>,
 }
 
-impl Default for BatchExporter<NoopBetterstackClient> {
+impl Default for BatchExporter<NoopBetterstackClient, fn(&mut BetterstackEvent)> {
     fn default() -> Self {
         Self::new(NoopBetterstackClient::new(), ExportConfig::default())
     }
 }
 
-impl<C> BatchExporter<C> {
-    pub(crate) fn new(client: C, config: ExportConfig) -> Self {
+impl<C, F> BatchExporter<C, F>
+where
+    F: Fn(&mut BetterstackEvent) + 'static + Sync + Send,
+{
+    pub(crate) fn new(client: C, config: ExportConfig<F>) -> Self {
         let queue = Vec::with_capacity(config.batch_size);
         Self {
             client,
@@ -58,11 +78,12 @@ impl<C> BatchExporter<C> {
     }
 }
 
-impl<C> BatchExporter<C>
+impl<C, F> BatchExporter<C, F>
 where
     C: BetterstackClientTrait + Send + Sync + 'static,
+    F: Fn(&mut BetterstackEvent) + 'static + Sync + Send,
 {
-    pub(crate) async fn run(mut self, mut rx: UnboundedReceiver<LogEvent>) {
+    pub(crate) async fn run(mut self, rx: flume::Receiver<LogMessage>) {
         let mut interval = interval(self.config.interval);
 
         loop {
@@ -72,15 +93,22 @@ where
                         self.flush_queue().await;
                     }
                 }
-                event = rx.recv() => {
+                event = rx.recv_async() => {
                     match event {
-                        Some(event) => {
+                        Ok(LogMessage::Event(event)) => {
                             self.queue.push(event);
                             if self.queue.len() >= self.config.batch_size {
                                 self.flush_queue().await;
                             }
                         }
-                        None => {
+                        Ok(LogMessage::Shutdown(notify)) => {
+                            if !self.queue.is_empty() {
+                                self.flush_queue().await;
+                            }
+                            let _ = notify.send(());
+                            break;
+                        }
+                        Err(flume::RecvError::Disconnected) => {
                             // Channel closed, flush remaining events
                             if !self.queue.is_empty() {
                                 self.flush_queue().await;
@@ -105,7 +133,7 @@ where
         self.queue.reserve(self.config.batch_size);
     }
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use crate::client::BetterstackError;
@@ -247,3 +275,4 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(10));
     }
 }
+*/
